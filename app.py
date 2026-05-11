@@ -1,103 +1,92 @@
 from flask import Flask, jsonify
 from flask_cors import CORS
-import upstox_client
-from upstox_client.rest import ApiException
-import os
-from datetime import datetime, timedelta
-import pytz
+import requests
 
 app = Flask(__name__)
 CORS(app)
 
-# ── Upstox credentials from Render environment variables ──
-API_KEY      = os.environ.get('UPSTOX_API_KEY', '')
-API_SECRET   = os.environ.get('UPSTOX_API_SECRET', '')
-REDIRECT_URI = os.environ.get('UPSTOX_REDIRECT_URI', '')
-ACCESS_TOKEN = os.environ.get('UPSTOX_ACCESS_TOKEN', '')
+# NSE requires browser-like headers or it returns 401/403
+NSE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Referer': 'https://www.nseindia.com/option-chain',
+    'Connection': 'keep-alive',
+}
 
-# ── Calculate next Nifty expiry (Tuesday) ──
-def get_next_expiry():
-    IST = pytz.timezone('Asia/Kolkata')
-    now = datetime.now(IST)
-    # Tuesday = weekday 1
-    days_ahead = (1 - now.weekday()) % 7
-    if days_ahead == 0:
-        # Today is Tuesday
-        if now.hour >= 15 and now.minute >= 30:
-            days_ahead = 7  # roll to next week
-    expiry = now + timedelta(days=days_ahead)
-    return expiry.strftime('%Y-%m-%d')
+NSE_OC_URL  = 'https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY'
+NSE_BASE_URL = 'https://www.nseindia.com'
+
+# ── Session with cookies (NSE requires this) ──
+def get_nse_session():
+    session = requests.Session()
+    session.headers.update(NSE_HEADERS)
+    session.get(NSE_BASE_URL, timeout=10)
+    session.get('https://www.nseindia.com/option-chain', timeout=10)
+    return session
 
 # ── Root: health check ──
 @app.route('/')
 def index():
-    return jsonify({'status': 'AATMAN V.02 server running', 'time': str(datetime.now())})
+    return jsonify({'status': 'AATMAN V.02 running on NSE direct feed'})
 
 # ── Option Chain endpoint ──
 @app.route('/option-chain')
 def option_chain():
     try:
-        expiry_date = get_next_expiry()
+        session  = get_nse_session()
+        response = session.get(NSE_OC_URL, timeout=15)
 
-        configuration = upstox_client.Configuration()
-        configuration.access_token = ACCESS_TOKEN
-        api_version = '2.0'
+        if response.status_code != 200:
+            return jsonify({'error': f'NSE returned {response.status_code}'}), 500
 
-        api_instance = upstox_client.OptionsApi(
-            upstox_client.ApiClient(configuration)
-        )
+        raw     = response.json()
+        records = raw.get('records', {})
+        data    = records.get('data', [])
 
-        # Nifty 50 instrument key
-        instrument_key = 'NSE_INDEX|Nifty 50'
+        if not data:
+            return jsonify({'error': 'No data from NSE'}), 500
 
-        response = api_instance.get_option_chain_data(
-            instrument_key=instrument_key,
-            expiry_date=expiry_date,
-            api_version=api_version
-        )
+        strikes_map = {}
 
-        raw = response.data
-        strikes = []
-        total_call_oi = 0
-        total_put_oi  = 0
-        max_call_oi   = 0
-        max_put_oi    = 0
-        call_wall     = 0
-        put_base      = 0
+        for entry in data:
+            price = entry.get('strikePrice')
+            if price is None:
+                continue
+            if price not in strikes_map:
+                strikes_map[price] = {'price': price, 'callOI': 0, 'putOI': 0}
+            if 'CE' in entry:
+                strikes_map[price]['callOI'] += entry['CE'].get('openInterest', 0)
+            if 'PE' in entry:
+                strikes_map[price]['putOI']  += entry['PE'].get('openInterest', 0)
 
-        for item in raw:
-            price    = item.strike_price
-            call_oi  = item.call_options.market_data.oi if item.call_options and item.call_options.market_data else 0
-            put_oi   = item.put_options.market_data.oi  if item.put_options  and item.put_options.market_data  else 0
+        strikes = sorted(strikes_map.values(), key=lambda x: x['price'])
 
-            strikes.append({
-                'price':  price,
-                'callOI': call_oi,
-                'putOI':  put_oi
-            })
+        # ── Metrics ──
+        total_call_oi = sum(s['callOI'] for s in strikes)
+        total_put_oi  = sum(s['putOI']  for s in strikes)
+        pcr       = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else 0
+        call_wall = max(strikes, key=lambda x: x['callOI'])['price']
+        put_base  = max(strikes, key=lambda x: x['putOI'])['price']
 
-            total_call_oi += call_oi
-            total_put_oi  += put_oi
-
-            if call_oi > max_call_oi:
-                max_call_oi = call_oi
-                call_wall   = price
-            if put_oi > max_put_oi:
-                max_put_oi = put_oi
-                put_base   = price
-
-        pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else 0
+        # ── Keep only 40 strikes nearest to ATM ──
+        atm_price = records.get('underlyingValue', 0)
+        if atm_price:
+            strikes = sorted(strikes, key=lambda x: abs(x['price'] - atm_price))[:40]
+            strikes = sorted(strikes, key=lambda x: x['price'])
 
         return jsonify({
             'pcr':      pcr,
             'callWall': call_wall,
             'putBase':  put_base,
-            'expiry':   expiry_date,
-            'strikes':  sorted(strikes, key=lambda x: x['price'])
+            'atm':      atm_price,
+            'expiry':   records.get('expiryDates', [''])[0],
+            'strikes':  strikes
         })
 
-    except ApiException as e:
-        return jsonify({'error': f'Upstox API error: {str(e)}'}), 500
+    except requests.exceptions.Timeout:
+        return jsonify({'error': 'NSE request timed out'}), 504
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
